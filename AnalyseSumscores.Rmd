@@ -1,0 +1,394 @@
+---
+title: "Analysing sum scores in the general linear model"
+author: "Guido Biele"
+date: "3/19/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rstan)
+library(HRQoL)
+library(parallel)
+library(VGAM)
+library(boot)
+library(TeachingDemos)
+library(fitdistrplus)
+library(data.table)
+source("utils.R")
+par (mar=c(3,3,2,1), mgp=c(2,.7,0), tck=-.01, cex.axis = 1.5, cex.lab = 1.5, cex.main = 1.75)
+```
+
+```{r, include=FALSE}
+```
+
+
+## Introduction
+
+
+Likert scales, especially sum scores derived from Likert scales, are important in mental health research. One potential disadvantage of Likert scale based sum scores is that they are often not normally distributed.
+
+This could be relevant in the context of multiple regression analysis, which is typically used when assessing the association between an exposure and an outcome, while also adjusting for confounders. Importantly, the most popular multiple regression models, multiple linear and logistic regression, are a priori not suited to analyze sum score data.
+
+This short document describes (a) why linear regression is theoretically not suited for the analysis of sum score data (b) which of the generalizations of the linear model are theoretically suited, and (c) examines if one looses anything if one nevertheless analyzes sum score data with linear or logistic regression.
+
+Before moving on, I'll highlight that simply calculating sum-scores is a short-cut. The best approach would be to fit item response models to all items and use resulting ability scores as outcomes in the further analysis. However, if this is to burdensome or a field has a strong tradition for sum-scores, this can be the best way to go.
+
+### Sum score examples
+
+To see how sum score data from Likert scales are distributed, we are looking at MoBa data. 
+
+```{r echo=FALSE, fig.width=10,fig.height=4}
+load("sumscores_moba.Rdata")
+md = md[,c(3,1,4)]
+par(mfrow = c(1,3))
+for (v in names(md)) hist(md[,v], main = v,
+                          xlab = "", 
+                          breaks = seq(min(md[,v],na.rm = T)-.5,
+                                       max(md[,v],na.rm = T)+.5),
+                          cex.axis = 1.5)
+```
+
+These sum scores are all generated from Likert scales with different numbers of items (6-11) with between 3 and 4 response categories. The sum scores were created by summing for each scale the scores over all items.
+
+The figure illustrates a number of things about sum scores:
+
+ * sum scores are bound to be at least 0 and also have an upper bound [number of items * (number of levels) -1]
+ * distributions of sum scores can look like normal distributions, but more often than not they do not
+ * sum score distributions can be extremely skewed.
+
+Distributions like the one seen for mother ratings on the Symptom Check List (SCL) are common for scores that try to assess clinically relevant symptoms or difficulties.
+
+
+### Distributions for sum scores
+
+If sum score data would generally look like the sum score for father ADHD symptoms above, it would be unproblematic to use standard tools from the statistical toolbox like t-tests or linear regression--which assume that model residuals are distributed normally--to analyse the data.
+
+To convince us that residuals are indeed not normally distributed, lets just plot them:
+
+```{r echo=FALSE, fig.width=10,fig.height=4, fig.align='center'}
+par(mfrow = c(1,3))
+for (v in names(md)) {
+  y = md[,v]-mean(md[,v],na.rm = T)
+  y = y[!is.na(y)]
+  fn = fitdist(y,"norm")
+  hist(y,freq = F, main = paste0("residuals of ",v))
+  curve(dnorm(x,fn$estimate[1],fn$estimate[2]),
+        from = min(y),
+        to = max(y),
+        col = "red", add = T)
+}
+```
+
+If the data are not normally distributed, how are they distributed? To answer this question, we need two things:
+
+1. A statistical idea about how the data came about (the data generative process)
+2. Some knowledge about probability distributions that can represent such a generative process.
+
+The second point is a bit harder, but the first point should be intuitive to people with a background in psychology. We can re-describe the process of coming to a sum score as one where:
+
+* each person has a (normally ditributed) ability to express a behavior captured in an item
+* this ability determines where on a continuum from minimal to maximal expression ([0-1]) of a behavior a person is located
+* we use integers to describe where on the contiuum for the expression of a behavior a person lies
+* items are related such that persons have an expected location on the [0-1] accross all items, but vary randomly around this location from item to item.
+
+That is, we assume that information about a persons ability and the number of items are sufficient to describe the expected sum score for each person. (Or, given the observed sum score and known number of items we would be able to infer the persons ability.)
+
+A simple probability distribution that comes close to capturing such a process is the binomial distribution, which is describe on Wikipedia as: 
+
+> the discrete probability distribution of the number of successes in a sequence of n independent experiments, each asking a yes–no question.
+
+This does not match our psychological intuition of ratings scales (or the procedure with which Likert scales are produced), because we expect that the response to one item is dependent on the response to other items in the same scale. A distributions that captures correlated responses to items is the beta-binomial distribution, which is a generalization of the binomial distribution. 
+
+TO put this more in statistical terms, we can (1) conceptualize the response to one item as governed by a binomial process, which is represented by the binomial distribution which has a number of trials (rating levels) and a probability of success (ability) . If we have many items and further assume that (2) the success probability has a mean and a variance, this should be described by the beta distribution (chance of success must lie between 0 and 1). If we put (1) and (2) together, we get the beta binomial distribution.
+
+**To summarize until now, we have seen that sum scores are typically not normally distributed, and we have described two alternative models to describe sum scores: The (less plausible) binomial model and the (more plausible) beta-binomial model.**
+
+Before we move on and see if analysis results from multiple regressions depend on which distribution we choose to describe our data, lets quickly check how well the distributions describe the data.
+
+```{r echo=FALSE, fig.width=10,fig.height=4, fig.align='center'}
+par(mfrow = c(1,3))
+load("pd_dists.Rdata")
+for (v in names(md)) {
+  ylim = range(rbind(pd[[v]]$counts_binom,
+                     pd[[v]]$counts_betabinom,
+                     pd[[v]]$counts_normal,
+                     pd[[v]]$counts_data))
+  xlim = quantile(pd[[v]]$y_rep_normal,c(.0001,1))
+  xlim[2] = ifelse(xlim[2]<pd[[v]]$max_y,pd[[v]]$max_y,xlim[2])
+  par(mar = c(2,.1,2,.1))
+  plot(0,type = "n", xlim = xlim, ylim = ylim, 
+       main = v, yaxt = "n", 
+       ylab  = "", bty = "n")
+  abline(v = pd[[v]]$range_y, lty = 2, col = "grey")
+  lines(pd[[v]]$breaks,pd[[v]]$counts_data, type='S', lwd = 4)
+  for(i in 1:100) {
+    lines(pd[[v]]$breaks,pd[[v]]$counts_normal[i,], type='S', col = adjustcolor("red", alpha = .075))
+    lines(pd[[v]]$breaks,pd[[v]]$counts_binom[i,], type='S', col = adjustcolor("blue", alpha = .075))
+    lines(pd[[v]]$breaks,pd[[v]]$counts_betabinom[i,], type='S', col = adjustcolor("green", alpha = .075))
+  }
+  legend("topleft",
+         col = c("red","blue","green"),
+         lty = 1, lwd = 2,
+         legend = c("normal","binomial","beta-binomial"),
+         bty = "n")
+}
+```
+
+
+The figures highlight different problems when using inappropriate models:
+
+* Beginning on the right hand side, the results for mCSL highlight that using the normal distribution (which would correspond for example to using a linear regression) implies prediction of negative values, which do however not exist.
+* The middle panel highlights the (expected) inability of the binomial distribution to account for correlated responses.
+* The two left figures show that the normal distribution can provide a reasonable model of the data when it is not very skewed.
+
+
+## Power and effect size estimations
+
+Even if the analysis so far confirms that using a beta-binomial model fits sum scores best, it might be that the problems at least of the normal distribution do not matter for practical purposes. This would be the case, if the normal model would be as good as the beta-binomial model in detecting effects (probability to detect an effect if there is one) and in estimating the size of the effect correctly.
+
+Of course, we can't know this for MoBa data, because we don't know the true association between for example maternal education and child ADHD. However, we can simulate data for which we know the effect and check how different regression models recover that effect.
+
+In particular, we will look at simulated sum score data where the shape of the outcome distribution and the strength of the association between exposure and outcome are varied. The models we are comparing are:
+
+* a linear regression model and
+* a beta-binomial regression model.
+
+A beta-binomial regression is similar to a linear regression. But instead of assuming that the outcomes are normally distributed, the beta-binomial regression assumes that the data have a beta-binomial distribution. 
+
+Ok, lets look simulated data:
+
+```{r echo=FALSE, fig.width=5,fig.height=5, fig.align='center'}
+K = 1
+N = 250
+par(mfrow = c(1,1))
+dist_plotter(mu = logit(.25),b = .025,phi = 15)
+```
+
+This figure shows simulated data for a sum score that goes up to 22 points. b = .025 means that when the exposure increases by one standard deviation, the expected probability to solve each item increases by 2.5 percent points. mu = .25 means that the expected probability to solve each item before the effect of the exposure is 25%. phi = 15 means there is a relatively low correlation between responses, whereas it is higher at phi = 5.
+
+The scatter plot in the figure and the regression line are only a visual aide to understand how strong the correlation between exposure and outcome are.
+
+Of course, sum score data can take many different forms. Therefore we will compare the linear regression and beta binomial regression for a number of different scenarios:
+
+```{r echo=FALSE, fig.width=10,fig.height=7, fig.align='center'}
+cex.main_orig = par("cex.main")
+mar_orig = par("mar")
+
+
+N = 250
+K = 1
+bs = c(.025, .05, .075, 0.15)
+mus = logit(c(.1,.25,.5))
+phis = c(5, 15)
+
+cex.main_orig = par("cex.main")
+mar_orig = par("mar")
+
+par(mfrow = c(4,6),cex.main = 1, mar = c(0,0,3,0))
+for (b in bs) {
+  for (mu in mus)  {
+    for  (phi in phis) {
+      dist_plotter(mu = mu, b = b, phi = phi, xaxt = "n")
+    }
+  }
+}
+par(cex.main = cex.main_orig)
+par(mar = mar_orig)
+
+```
+
+
+The question now is: ** "What is our chance to detect exposure outcome associations in these scenarios when using different regression models?" ** To find this out, I simulated for each scenario 1000 data sets and 
+
+* ran beta-binomial, linear and logistic regressions
+* checked in how many out of the 1000 data sets an association was correctly detected (power)
+* and calculate the estimated effect size.
+
+The next figures shows power results. First lets look at one scenario to explain the plot.
+
+```{r echo=FALSE, fig.width=5,fig.height=5, fig.align='center'}
+load("sims.Rdata")
+K = 1
+N = 100
+breaks = -.5:22.5
+cols = list(bbr = "green", l = "red", lr = "blue")
+
+df = data.frame(all_stats,row.names = NULL)
+df$model = rep(c("bbr","l","lr"),length(bs)*3)
+df$mu = inv.logit(df$mu)
+
+mu = logit(.25)
+phi = 5
+par (mar=c(3,3,2,1), mgp=c(2,.7,0), tck=-.01, cex.axis = 1.5, cex.lab = 1.5, cex.main = 1.75)
+
+
+plot(0,type = "n", ylim = c(0,1), xlim = range(bs),
+     ylab = "power",
+     xlab = "b", bty = "n",xaxt = "n",
+     main = paste0("mu=", inv.logit(mu), ", phi=",phi))
+axis(1,pos = 0)
+
+for (m in unique(df$model)) {
+  tmp_stats = df[df$mu == inv.logit(mu) & df$phi == phi & df$model == m,]
+  lines(tmp_stats$b, tmp_stats$power, col = cols[[m]])
+}
+
+y = rbetabinom.ab(5000,
+                  size = 22,
+                  shape1 = inv.logit(mu)*phi,
+                  shape2 = (1-inv.logit(mu))*phi)
+h = hist(y,plot = F, breaks = breaks)
+
+x_scale = coef(lm(c(.04,.05)~range(h$mids)))
+scaled_X = x_scale[1] + h$mids*x_scale[2]
+y_scale = coef(lm(c(0,.33)~c(0,max(h$counts))))
+scaled_Y = y_scale[1] + h$counts*y_scale[2]
+
+lines(c(.0395,scaled_X),c(0,scaled_Y),"S", col = "darkred")
+legend("topleft", lty = 1, bty = "n",
+       col = c("green","red","blue"),
+       legend = c("beta binomial","linear","logistic"), cex = 1.5)
+```
+
+On the x axis are effect size and on the y axis is the power (chance to detect an effect given the effect exists). The colors in different lines indicate power for different regression models. The histogram in the bottom right corner displays the distribution of the outcome variable.
+
+Now we can look at all scenarios.
+    
+```{r echo=FALSE, fig.width=10,fig.height=7}
+par(mfrow = c(2,3))
+par (mar=c(3,3,2,1), mgp=c(2,.7,0), tck=-.01, cex.axis = 1.5, cex.lab = 1.5, cex.main = 1.75)
+for (phi in phis)  {
+  for   (mu in mus) {
+    
+    
+    plot(0,type = "n", ylim = c(0,1), xlim = range(bs),
+         ylab = "power",
+         xlab = "b", bty = "n",xaxt = "n",
+         main = paste0("mu=", inv.logit(mu), ", phi=",phi))
+    axis(1,pos = -.01)
+    
+    for (m in unique(df$model)) {
+      tmp_stats = df[df$mu == inv.logit(mu) & df$phi == phi & df$model == m,]
+      lines(tmp_stats$b, tmp_stats$power, col = cols[[m]])
+    }
+    
+    y = rbetabinom.ab(5000,
+                      size = 22,
+                      shape1 = inv.logit(mu)*phi,
+                      shape2 = (1-inv.logit(mu))*phi)
+    h = hist(y,plot = F, breaks = breaks)
+    
+    x_scale = coef(lm(c(.04,.05)~range(h$mids)))
+    scaled_X = x_scale[1] + h$mids*x_scale[2]
+    y_scale = coef(lm(c(0,.33)~c(0,max(h$counts))))
+    scaled_Y = y_scale[1] + h$counts*y_scale[2]
+    
+    lines(c(.0395,scaled_X),c(0,scaled_Y),"S", col = "darkred")
+    legend("topleft", lty = 1, bty = "n",
+           col = c("green","red","blue"),
+           legend = c("beta binomial","linear","logistic"), cex = 1.5)
+    
+  }
+}
+
+```
+
+We can see that the beta-binomial model generally has the highest power. The simple linear regression does not lag behind a lot, but especially if the data are skewed the linear regression will typically be worse at detecting associations. The logistic regression is just bad. No wonder, as it is throwing away a lot of information.
+
+Now lets look at the estimated exposure outcome associations:
+
+```{r echo=FALSE, fig.width=10,fig.height=7}
+par (mar=c(3,3,2,1), mgp=c(2,.7,0), tck=-.01, cex.axis = 1.5, cex.lab = 1.5, cex.main = 1.75)
+
+par(mfrow = c(2,3))
+for (phi in phis)  {
+  for   (mu in mus) {
+    
+    
+    plot(0,type = "n", ylim = range(bs), xlim = range(bs),
+         ylab = "b-est",
+         xlab = "b", bty = "n",xaxt = "n",
+         main = paste0("mu=", inv.logit(mu), ", phi=",phi))
+    axis(1,pos = 0.018)
+    abline(0,1, col = "grey", lty = 2)
+    for (m in unique(df$model)[1:2]) {
+      tmp_stats = df[df$mu == inv.logit(mu) & df$phi == phi & df$model == m,]
+      lines(tmp_stats$b, tmp_stats$b_hat, col = cols[[m]])
+    }
+    
+    y = rbetabinom.ab(5000,
+                      size = 22,
+                      shape1 = inv.logit(mu)*phi,
+                      shape2 = (1-inv.logit(mu))*phi)
+    h = hist(y,plot = F, breaks = breaks)
+    
+    x_scale = coef(lm(c(.04,.05)~range(h$mids)))
+    scaled_X = x_scale[1] + h$mids*x_scale[2]
+    y_scale = coef(lm(c(.019,.03)~c(0,max(h$counts))))
+    scaled_Y = y_scale[1] + h$counts*y_scale[2]
+    
+    lines(c(.0395,scaled_X),c(.018,scaled_Y),"S", col = "darkred")
+    legend("topleft", lty = 1, bty = "n",
+           col = c("green","red","blue"),
+           legend = c("beta binomial","linear","logistic"), cex = 1.5)
+    
+  }
+}
+```
+
+It should not be a big surprise that the effects estimated by the linear regression model are weaker than those of the beta binomial model, because the linear regression has a lower power.
+
+
+Before we come to the conclusion, I'd like to highlight one important fact that helps understanding the research literature and planning realistic studies. As you knew and was shown here, the true effect size has an important effect on power. But from where do we get an effect size estimate when we are planning a study? One apparently simple approach is to look at the published literature. However, it is difficult to get realistic effect size estimates from the literature because of the so called "significant filter". The idea here is that  if effects are not very large and vary randomly from study to study, the published literature typically reflects only the subset of studies where the effect happened to be large enough to reach significance.
+
+Here are plots of effect size estimates, once for all simulated data sets and once only for those that detected a significant effect.
+
+
+```{r echo=FALSE, fig.width=10,fig.height=7}
+all_sims = c()
+for (s in 1:length(sims)) {
+  stats = data.table(sims[[s]]$stats)
+  stats[,mu := round(inv.logit(sims[[s]]$mu),digits = 2)]
+  stats[,b := sims[[s]]$b]
+  stats[,phi := sims[[s]]$phi]
+  all_sims = rbind(all_sims,stats)
+}
+all_sims$b = round(all_sims$b,digits = 2)
+
+par(mfrow = c(2,2))
+for (mb in c(0.02,0.03,0.04,0.05)) {
+  d1f = density(all_sims[b == mb, me_bb])
+  d2f = density(all_sims[b == mb, me_lin])
+  d1 = density(all_sims[`beta-binomial` > 1.96 & b == mb, me_bb])
+  d2 = density(all_sims[linear > 1.96 & b == mb, me_lin])
+  plot(0,type = "n",
+       xlim = c(-.05,.15),
+       ylim = range(c(d1$y,d2$y,d1f$y,d2f$y)),
+       xlab = "estimated effect b",
+       ylab = "density",
+       bty = "n",
+       main = paste0("true b = ",mb))
+  lines(d1, col = "green")
+  lines(d2, col = "red")
+  lines(d1f, col = "green", lty = 2)
+  lines(d2f, col = "red", lty = 2)
+  legend("topright",
+         col = c("green","red","grey","grey"),
+         lty = c(1,1,1,2),
+         bty = "n",
+         legend = c("beta binomial","linear","all estimates", "significant estimates"))
+  abline(v = mb)
+}
+```
+
+
+
+So here are the take home messages:
+
+ * Be careful when looking at the published literature to get an idea of true effect sizes
+ * Sum score data do typically not follow a normal distribution: They have lower and upper bounds and are often skewed.
+ * Theoretically, the correct model to use for sum score data is the beta-binomial regression model. Beta-binomial regressions can be performed for example in Stata or R, but to the best of my knowledge not in SPSS.
+ * Practically, a linear regression will also do the job (have acceptable power) under the condition that the data are not very skewed.
+ * So, if you want to be sure to have maximal power, use a beta-binomial regression.
+
